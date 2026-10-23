@@ -206,6 +206,8 @@ class Tracker {
   bool has_out_k_;
   int out_k_;
   bool out_env_;
+  // A checked, separated surface can resolve one floor-cycle discrepancy.
+  bool surface_anchor_, surface_conflict_, vote_surface_;
 
   TrackResult res_;                                        // the value estimate() returns
 };

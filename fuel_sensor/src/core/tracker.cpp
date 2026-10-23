@@ -264,6 +264,7 @@ void Tracker::reset_lock() {                                     // reset_lock()
   recheck_ = false; recheck_left_ = 0; recheck_keep_ = false; has_post_ = false; post_t0_ = post_T_ = 0.0;
   doubt_ = false;
   has_out_k_ = false; out_k_ = 0; out_env_ = true;
+  surface_anchor_ = surface_conflict_ = vote_surface_ = false;
 }
 
 double Tracker::output_level() const {                          // output_level(): last estimate -> last confirmed -> stored -> 0
@@ -647,16 +648,49 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
   const double h_env_s = is_set(s_env) ? kD0 - s_env : kNaN;
   const double h_env_b = h_bottom(b_env);
   const bool b_fits = b_env < kBFitsLimit;                      // the template fits inside the sweep
-  // --- memoryless floor-cycle reference: surface envelope (>= 35 mm, separated, consistent), else the floor envelope (no surface)
+  // A separated surface may resolve ONE floor-cycle discrepancy, but only when
+  // its own phase/envelope and the floor phase independently agree. Do not relax
+  // the coarse 4-mm gate to accept an arbitrary echo or a multi-cycle mismatch.
+  bool surface_ref = false;
+  double surface_h = kNaN;
+  if (is_set(s_env) && h_env_s >= kEnvTrust && b_fits && is_set(xb) && pstd < 8.0) {
+    double ps;
+    const double xs = phase(s_env, &ps);
+    if (is_set(xs) && ps < 8.0) {
+      const double hs = kD0 - snap(xs - corr + c0_s_, s_env);
+      const double bs = snap(xb, kD0 + nm1 * hs);
+      const double hs_floor = h_bottom(bs);
+      const double dk = (bs - snap(xb, b_env)) / kStep;
+      if (std::fabs(hs - h_env_s) <= kEnvTol && std::fabs(hs - hs_floor) <= 1.0 && std::fabs(dk) < 1.5 &&
+          (surface_anchor_ || surface_conflict_ || std::fabs(h_env_s - h_env_b) >= 4.0)) {
+        surface_ref = true;
+        surface_h = hs_floor;
+      }
+    }
+  }
   double ref_h = kNaN;
   bool sep_ok = is_set(h_env_s) && h_env_s >= 35.0;
-  if (sep_ok && h_env_s < kEnvTrust && is_set(xb))              // its floor cycle needs n and d0: the floor envelope must agree
+  if (sep_ok && h_env_s < kEnvTrust && is_set(xb))
     sep_ok = std::fabs(snap(xb, kD0 + nm1 * h_env_s) - snap(xb, b_env)) < 0.5 * kStep;
-  if (sep_ok && (h_env_s < kEnvTrust || (b_fits && std::fabs(h_env_s - h_env_b) < 4.0))) {
+  if (surface_ref) {
+    ref_h = surface_h;
+    if (is_set(prev_b_)) {
+      const double displayed = prev_b_ + (has_out_k_ ? out_k_ * kStep : 0.0);
+      if (std::fabs(snap(xb, kD0 + nm1 * ref_h) - snap(xb, displayed)) > 0.5 * kStep)
+        surface_conflict_ = true;  // a pending disagreement must not be labelled confirmed
+    }
+  } else if (sep_ok && (h_env_s < kEnvTrust || (b_fits && std::fabs(h_env_s - h_env_b) < 4.0))) {
     ref_h = h_env_s < kEnvTrust ? h_env_s : h_env_b;
-    vote_.push(ref_h);
-  } else if (!is_set(s_env) && h_env_b >= kEnvTrust && b_fits) {
+  } else if (!is_set(s_env) && h_env_b >= kEnvTrust && b_fits && !surface_anchor_ && !surface_conflict_) {
     ref_h = h_env_b;
+  }
+  // After a checked surface anchor, a coarse floor observation cannot undo its
+  // cycle when the surface momentarily disappears or its candidate changes.
+  if (!surface_ref && (surface_anchor_ || surface_conflict_) && is_set(ref_h) && is_set(prev_b_) &&
+      std::fabs(snap(xb, kD0 + nm1 * ref_h) - snap(xb, prev_b_)) > 0.5 * kStep) ref_h = kNaN;
+  if (is_set(ref_h)) {
+    if (surface_ref != vote_surface_) vote_.clear();
+    vote_surface_ = surface_ref;
     vote_.push(ref_h);
   } else {
     vote_.clear();
@@ -671,7 +705,7 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
     res_.cycle_step = 0;
     return res_;
   }
-  const int need = anchored_ ? kVoteN : kFirstN;
+  const int need = (anchored_ || surface_ref) ? kVoteN : kFirstN;
   double med = kNaN;
   if (vote_.size() >= need) {                                   // a steady vote: 10-90 % spread below steady_mm
     double v[cal::kVoteN];
@@ -708,20 +742,19 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
   if (!anchored_) {
     if (is_set(ref_h) && (is_set(med) || (cycle_source_ != CycleSource::Shape && cycle_source_ != CycleSource::Memory))) {
       const double cand = snap(xb, kD0 + nm1 * (is_set(med) ? med : ref_h));
-      // r15: a Shape/Memory source is already a trusted, continuous track (that is exactly why it is exempt from
-      // needing a full median vote above); the first vote to complete must not be allowed to silently override it
-      // by close to a whole floor cycle with no check at all (15 Oct: a good 'shape' track at 64.7 mm was clobbered
-      // by the very first anchor vote, which fired with no surface candidate as the floor envelope ticked past
-      // kEnvTrust). Apply the SAME half-cycle continuity gate the already-anchored branch below uses.
-      if ((cycle_source_ == CycleSource::Shape || cycle_source_ == CycleSource::Memory) && is_set(b_cont)
-          && std::fabs(cand - b_cont) > 0.5 * kStep) {
+      // v6.12: a single coarse reference cannot re-seed a carried track. Wait for
+      // the median vote; keep collecting it while waiting. The inherited 1.2.5
+      // guard also prevents a first anchor from overriding a Shape/Memory track.
+      if (is_set(b_cont) && std::fabs(cand - b_cont) > 0.5 * kStep
+          && (!is_set(med) || (!surface_ref && (cycle_source_ == CycleSource::Shape || cycle_source_ == CycleSource::Memory)))) {
         b_fine = b_cont;
-        vote_.clear();
+        if (is_set(med)) vote_.clear();
       } else {
         b_fine = cand;
         if (ref_h < kEnvTrust) { has_out_k_ = false; out_env_ = false; }   // r8a: the SURFACE echo set the cycle
         if (is_set(med)) {
           anchored_ = true; cycle_uncertain_ = false; cycle_source_ = CycleSource::Anchored; doubt_ = false; mem_verify_ = 0;
+          if (surface_ref) { surface_anchor_ = true; surface_conflict_ = false; }
         }
       }
     } else if (is_set(prev_b_)) {
@@ -736,6 +769,10 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
       b_fine = snap(xb, kD0 + nm1 * med);
       ++cnt_.resnaps;
       vote_.clear();
+    }
+    if (is_set(med) && surface_ref) {
+      surface_anchor_ = true; surface_conflict_ = false;
+      cycle_uncertain_ = false; doubt_ = false; mem_verify_ = 0;
     }
   }
   if (h_bottom(b_fine) < kBoundLo) {                            // below the floor is impossible: back to the near-empty assumption
@@ -789,11 +826,16 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
         const bool stdy = (lmax - lmin) <= kSuSteadyMm;
         if (best && (stdy || first) && lead >= need_lead) {
           const double h_new = h_bottom(b_fine + k * kStep), h_cur = h_bottom(b_fine);
-          // v6.11: from kEnvOutLo a still-fuel re-decision never moves the level AWAY from the floor envelope (Exp12 at 28 mm:
-          // a biased fit moved a right level one cycle low, confirmed for 414 s; review round 1, stays-correct analysis)
-          if (k == 0 || first ||
+          // v6.12: the first fit must also respect the level already displayed. The internal
+          // assumed track may be near zero while out_k_ puts the display on an envelope cycle.
+          // Even k == 0 can jump the display when choosing Shape clears that output offset.
+          const double h_display = h_bottom(b_fine + (has_out_k_ ? out_k_ * kStep : 0.0));
+          const bool first_ok = h_env_b < kEnvOutLo ||
+              (std::fabs(h_new - h_env_b) <= kEnvTol &&
+               std::fabs(h_new - h_env_b) <= std::fabs(h_display - h_env_b));
+          if ((first && first_ok) || (!first && (k == 0 ||
               (h_cur >= kSuRelMm && h_new >= kSuRelMm &&
-               (h_env_b < kEnvOutLo || std::fabs(h_new - h_env_b) < std::fabs(h_cur - h_env_b)))) {
+               (h_env_b < kEnvOutLo || std::fabs(h_new - h_env_b) < std::fabs(h_cur - h_env_b)))))) {
             if (k != 0) {
               b_fine = b_fine + k * kStep; ++cnt_.shape_resnaps; su_votes_.clear(); su_levels_.clear();
             }
@@ -829,16 +871,18 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
   if (anchored_ && !recheck_ && is_set(h_s) && h_b >= kScGateH && pstd < 20 && n_blk_ < cal::kScBlkN)
     blk_[n_blk_++] = BlkItem{h_b, h_s - h_b, b_fine - kC0, s_fine - c0_s_};
   if (blk_k_ == 0) sc_block();
-  const TrackState state = (!recheck_ && !doubt_ && (!cycle_uncertain_ || cycle_source_ == CycleSource::Shape))
+  const TrackState state = (!surface_conflict_ && !recheck_ && !doubt_ && (!cycle_uncertain_ || cycle_source_ == CycleSource::Shape))
                                ? TrackState::Confirmed : TrackState::Uncertain;   // a confidence-gated decision counts as confirmed
   if (state == TrackState::Confirmed) stored_ = h_b;
-  const bool check = (is_set(gap_ema_) && std::fabs(gap_ema_) > kGapAlarmMm) || std::fabs(leak_mm_) > 0.5;
-  double h_out = h_b;                                           // r12b: while the cycle is only the near-empty assumption, show
-  if (cycle_source_ != CycleSource::Assumed) {                  // the floor envelope's cycle where it is good (3/4-cycle hysteresis)
+  const bool check = surface_conflict_ || (is_set(gap_ema_) && std::fabs(gap_ema_) > kGapAlarmMm) || std::fabs(leak_mm_) > 0.5;
+  double h_out = h_b;                                           // while assumed, seed the display from the envelope once
+  if (cycle_source_ != CycleSource::Assumed) {
     has_out_k_ = false;
-  } else if (out_env_ && h_env_b >= kEnvOutLo && (!has_out_k_ || h_bottom(b_fine + out_k_ * kStep) >= kEnvOutLo)) {
+  } else if (!has_out_k_ && out_env_ && h_env_b >= kEnvOutLo) {
     const double r = (kD0 + nm1 * h_env_b - b_fine) / kStep;
-    if (!has_out_k_ || std::fabs(r - out_k_) > 0.75) { has_out_k_ = true; out_k_ = static_cast<int>(std::nearbyint(r)); }
+    // v6.12: seed once, then carry by phase. A noisy envelope is not new cycle evidence.
+    // Shape/anchor/memory decisions still establish an absolute cycle through their gates.
+    has_out_k_ = true; out_k_ = static_cast<int>(std::nearbyint(r));
   }
   if (has_out_k_) h_out = h_bottom(b_fine + out_k_ * kStep);
   TrackResult& L = last_;
@@ -849,14 +893,14 @@ const TrackResult& Tracker::estimate(double now) {              // estimate()
   L.state = state;
   L.check = check;
   L.s = s_fine; L.b = b_fine; L.s_env = s_env; L.b_env = b_env;
-  L.cycle_uncertain = cycle_uncertain_ || recheck_;
+  L.cycle_uncertain = cycle_uncertain_ || recheck_ || surface_conflict_;
   L.cycle_source = cycle_source_;
   L.su_state = su_state_;
   L.h_b = h_b; L.h_s = h_s; L.pstd = pstd; L.disturbed = false;
   L.n = n_; L.c0_s = c0_s_; L.leak_mm = leak_mm_; L.gap_ema = gap_ema_;
   L.verifying = mem_verify_ > 0 && in_window;
   L.recheck = recheck_;
-  L.doubt = doubt_;
+  L.doubt = doubt_ || surface_conflict_;
   L.cont = is_set(b_cont);                                      // fuel ledger: the phase-continuity move of the reported level
   L.cycle_step = L.cont ? static_cast<int>(std::nearbyint((b_fine - b_cont) / kStep)) + ((has_out_k_ ? out_k_ : 0) - out_prev) : 0;
   has_last_ = true;
